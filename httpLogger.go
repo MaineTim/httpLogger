@@ -71,9 +71,9 @@ InsertedDatetime
 	}
 	defer stmt.Close()
 
-	_, err2 := stmt.Exec(entry.StartTime, entry.EndTime)
-	if err2 != nil {
-		log.Debug("Exec result: " + err2.Error())
+	_, err = stmt.Exec(entry.StartTime, entry.EndTime)
+	if err != nil {
+		log.Debug("Exec result: " + err.Error())
 		return errors.Wrap(err, "storeRunEntry:stmt.Exec")
 	}
 	log.Info("Logged run time.")
@@ -123,7 +123,7 @@ func main() {
 	Formatter.TimestampFormat = "02-Jan-2006 15:04:05"
 	Formatter.FullTimestamp = true
 	log.SetFormatter(Formatter)
-	log.SetLevel(log.DebugLevel)
+	log.SetLevel(log.InfoLevel)
 
 	arguments, _ := docopt.Parse(usage, nil, true, version, false)
 	dbpath := arguments["<DBasePath>"].(string)
