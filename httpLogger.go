@@ -30,7 +30,6 @@ type RunEntry struct {
 }
 
 var db *sql.DB
-var storeRunEntryHandlerError error
 var storeRunTempHandlerError error
 var storeTemperatureHandler error
 
@@ -57,6 +56,7 @@ InsertedDatetime DATETIME
 }
 
 func storeRunEntry(entry RunEntry) error {
+	log.Debug("Entered storeRunEntry")
 	sql_additem := `
 INSERT INTO runtimes(
 StartTime,
@@ -66,11 +66,14 @@ InsertedDatetime
 `
 	stmt, err := db.Prepare(sql_additem)
 	if err != nil {
+		log.Debug("Prepare result: " + err.Error())
 		return errors.Wrap(err, "storeRunEntry:db.Prepare")
 	}
 	defer stmt.Close()
 
-	if _, err2 := stmt.Exec(entry.StartTime, entry.EndTime); err2 != nil {
+	_, err2 := stmt.Exec(entry.StartTime, entry.EndTime)
+	if err2 != nil {
+		log.Debug("Exec result: " + err2.Error())
 		return errors.Wrap(err, "storeRunEntry:stmt.Exec")
 	}
 	log.Info("Logged run time.")
@@ -78,19 +81,37 @@ InsertedDatetime
 }
 
 func storeRunEntryHandler(writer http.ResponseWriter, request *http.Request) {
-	writer.Header().Set("Content-Type", "application/json")
+	var storeRunEntryHandlerError error = nil
 	var entry RunEntry
 
+	respond := func() {
+		if storeRunEntryHandlerError != nil {
+			writer.WriteHeader(http.StatusInternalServerError)
+			writer.Write([]byte(storeRunEntryHandlerError.Error()))
+		} else {
+			writer.WriteHeader(http.StatusCreated)
+			writer.Write([]byte("RunEntry stored"))
+		}
+	}
+
+	writer.Header().Set("Content-Type", "application/json")
+	log.Debug("Entered storeRunEntryHandler")
 	body, err := ioutil.ReadAll(request.Body)
 	if err != nil {
 		storeRunEntryHandlerError = errors.Wrap(err, "storeRunEntryHandler:ioutil.ReadAll")
+		respond()
 		return
 	}
 	if err := json.Unmarshal(body, &entry); err != nil {
 		storeRunEntryHandlerError = errors.Wrap(err, "storeRunEntryHandler:json.Unmarshal")
+		respond()
 		return
 	}
-	storeRunEntry(entry)
+	storeRunEntryHandlerError = storeRunEntry(entry)
+	if storeRunEntryHandlerError != nil {
+		log.Debug("storeRunEntryHandlerError = " + storeRunEntryHandlerError.Error())
+	}
+	respond()
 }
 
 func main() {
@@ -102,6 +123,7 @@ func main() {
 	Formatter.TimestampFormat = "02-Jan-2006 15:04:05"
 	Formatter.FullTimestamp = true
 	log.SetFormatter(Formatter)
+	log.SetLevel(log.DebugLevel)
 
 	arguments, _ := docopt.Parse(usage, nil, true, version, false)
 	dbpath := arguments["<DBasePath>"].(string)
