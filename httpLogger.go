@@ -6,7 +6,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	log "github.com/Sirupsen/logrus"
-	//"github.com/davecgh/go-spew/spew"
+	// "github.com/davecgh/go-spew/spew"
 	"github.com/docopt/docopt-go"
 	"github.com/gorilla/mux"
 	_ "github.com/mattn/go-sqlite3"
@@ -23,7 +23,15 @@ const version = ".01a-2017Nov19"
 const usage = `
 httpLogger
 
-Usage: httpLogger
+Usage: httpLogger [options]
+
+Options:
+ -d LEVEL  Set logging level. 
+             i = Info
+             e = Error
+             d = Debug
+             [default: e]
+ -v         Show version.
 `
 const runtimesSQLTable = `
 CREATE TABLE IF NOT EXISTS runtimes(
@@ -76,6 +84,9 @@ var (
 
 func initDBase(filepath string) (*sql.DB, error) {
 	db, err := sql.Open("sqlite3", filepath)
+	if err == nil && db != nil {
+		_, err = db.Exec("pragma synchronous")
+	}
 	if err != nil {
 		return nil, errors.Wrap(err, "initDBase")
 	}
@@ -253,9 +264,16 @@ func main() {
 	Formatter.TimestampFormat = "02-Jan-2006 15:04:05"
 	Formatter.FullTimestamp = true
 	log.SetFormatter(Formatter)
-	log.SetLevel(log.DebugLevel)
-
-	_, _ = docopt.Parse(usage, nil, true, version, false)
+	arguments, _ := docopt.Parse(usage, nil, true, version, false)
+	logLevel := arguments["-d"]
+	switch logLevel {
+	case "d":
+		log.SetLevel(log.DebugLevel)
+	case "i":
+		log.SetLevel(log.InfoLevel)
+	default:
+		log.SetLevel(log.ErrorLevel)
+	}
 	log.Info("httpLogger " + version + " starting")
 	if runtimesDB, err = initDBase(configFile.pathRuntimesDB); err != nil {
 		log.Errorf("Runtimes database initialization failed with error: %s\n", err)
