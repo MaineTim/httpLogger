@@ -241,7 +241,7 @@ func main() {
 	viper.SetConfigFile("httpLogger.toml")
 	//	viper.AddConfigPath(".")
 	if err = viper.ReadInConfig(); err != nil {
-		log.Errorf("Config file not found: %s", err)
+		log.Errorf("Config file error: %s", err)
 		runtime.Goexit()
 	} else {
 		configFile.pathRuntimesDB = viper.GetString("DBs.runtimes")
