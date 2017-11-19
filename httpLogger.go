@@ -19,7 +19,7 @@ import (
 	"time"
 )
 
-const version = ".01a-2017Nov18"
+const version = ".01a-2017Nov19"
 const usage = `
 httpLogger
 
@@ -29,18 +29,18 @@ const runtimesSQLTable = `
 CREATE TABLE IF NOT EXISTS runtimes(
 StartTime TEXT,
 EndTime TEXT,
-InsertedDatetime DATETIME
+InsertedDatetime TEXT
 );
 `
 const tempSQLTable = `
 CREATE TABLE IF NOT EXISTS temps(
-Basement FLOAT,
-Bed FLOAT, 
-Crawlspace FLOAT, 
-Downstairs FLOAT,
-Garage FLOAT,
-Upstairs FLOAT,
-InsertedDatetime DATETIME
+Basement REAL,
+Bed REAL, 
+Crawlspace REAL, 
+Downstairs REAL,
+Garage REAL,
+Upstairs REAL,
+InsertedDatetime TEXT
 );
 `
 
@@ -50,12 +50,12 @@ type RunEntry struct {
 }
 
 type TempEntry struct {
-	Basement   float32 `json:"basement"`
-	Bed        float32 `json:"bed"`
-	Crawlspace float32 `json:"crawlspace"`
-	Downstairs float32 `json:"downstairs"`
-	Garage     float32 `json:"garage"`
-	Upstairs   float32 `json:"upstairs"`
+	Basement   float64 `json:"basement"`
+	Bed        float64 `json:"bed"`
+	Crawlspace float64 `json:"crawlspace"`
+	Downstairs float64 `json:"downstairs"`
+	Garage     float64 `json:"garage"`
+	Upstairs   float64 `json:"upstairs"`
 }
 
 type ConfigFile struct {
@@ -96,7 +96,7 @@ INSERT INTO runtimes(
 StartTime,
 EndTime,
 InsertedDatetime
-) values(?, ?, CURRENT_TIMESTAMP)
+) values(?, ?, ?)
 `
 	stmt, err := runtimesDB.Prepare(sqlAdditem)
 	if err != nil {
@@ -105,7 +105,7 @@ InsertedDatetime
 	}
 	defer stmt.Close()
 
-	_, err = stmt.Exec(entry.StartTime, entry.EndTime)
+	_, err = stmt.Exec(entry.StartTime, entry.EndTime, time.Now().Format(time.RFC3339))
 	if err != nil {
 		log.Debug("Exec result: " + err.Error())
 		return errors.Wrap(err, "storeRunEntry:stmt.Exec")
@@ -160,7 +160,7 @@ Downstairs,
 Garage,
 Upstairs,
 InsertedDatetime
-) values(?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+) values(?, ?, ?, ?, ?, ?, ?)
 `
 	stmt, err := db.Prepare(sqlAdditem)
 	if err != nil {
@@ -170,7 +170,7 @@ InsertedDatetime
 	defer stmt.Close()
 
 	_, err = stmt.Exec(entry.Basement, entry.Bed, entry.Crawlspace,
-		entry.Downstairs, entry.Garage, entry.Upstairs)
+		entry.Downstairs, entry.Garage, entry.Upstairs, time.Now().Format(time.RFC3339))
 	if err != nil {
 		log.Debug("Exec result: " + err.Error())
 		return errors.Wrap(err, "storeTempEntry:stmt.Exec")
@@ -197,11 +197,11 @@ func storeTempsHandler(writer http.ResponseWriter, request *http.Request) {
 	log.Debug("Entered storeTempsHandler")
 	vars := mux.Vars(request)
 	command := vars["command"]
-	log.Debugf("command = %s\n", command)
+	log.Debugf("command = %s", command)
 	var netClient = &http.Client{
 		Timeout: time.Second * 30,
 	}
-	log.Debugf("Sending GET to: %s\n", configFile.urlTempServer)
+	log.Debugf("Sending GET to: %s", configFile.urlTempServer)
 	response, err := netClient.Get(configFile.urlTempServer)
 	if err != nil {
 		storeTempsHandlerError = errors.Wrap(err, "storeTempsHandler:netClient.Get")
