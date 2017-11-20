@@ -37,7 +37,7 @@ const runtimesSQLTable = `
 CREATE TABLE IF NOT EXISTS runtimes(
 StartTime TEXT,
 EndTime TEXT,
-InsertedDatetime TEXT
+InsertionTime TEXT
 );
 `
 const tempSQLTable = `
@@ -106,7 +106,7 @@ func storeRunEntry(entry RunEntry) error {
 INSERT INTO runtimes(
 StartTime,
 EndTime,
-InsertedDatetime
+InsertionTime
 ) values(?, ?, ?)
 `
 	stmt, err := runtimesDB.Prepare(sqlAdditem)
