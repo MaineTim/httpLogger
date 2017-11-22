@@ -15,11 +15,13 @@ import (
 	"io/ioutil"
 	"net/http"
 	"os"
+	"os/signal"
 	"runtime"
+	"syscall"
 	"time"
 )
 
-const version = ".01a-2017Nov19"
+const version = ".01b-2017Nov21"
 const usage = `
 httpLogger
 
@@ -80,6 +82,7 @@ var (
 	storeRunTempHandlerError error
 	storeTemperatureHandler  error
 	configFile               ConfigFile
+	tempLoggerChan           = make(chan int, 1)
 )
 
 func initDBase(filepath string) (*sql.DB, error) {
@@ -141,6 +144,7 @@ func storeRunEntryHandler(writer http.ResponseWriter, request *http.Request) {
 
 	writer.Header().Set("Content-Type", "application/json")
 	log.Debug("Entered storeRunEntryHandler")
+	tempLoggerChan <- 0
 	body, err := ioutil.ReadAll(request.Body)
 	if err != nil {
 		storeRunEntryHandlerError = errors.Wrap(err, "storeRunEntryHandler:ioutil.ReadAll")
@@ -158,6 +162,28 @@ func storeRunEntryHandler(writer http.ResponseWriter, request *http.Request) {
 	}
 	respond()
 	log.Debug("Exiting storeRunEntryHandler")
+}
+
+func getTemperatures() (TempEntry, error) {
+
+	var entry TempEntry
+	var netClient = &http.Client{
+		Timeout: time.Second * 30,
+	}
+
+	log.Debugf("Sending GET to: %s", configFile.urlTempServer)
+	response, err := netClient.Get(configFile.urlTempServer)
+	if err != nil {
+		return TempEntry{}, errors.Wrap(err, "getTemperatures:netClient.Get")
+	}
+	body, err := ioutil.ReadAll(response.Body)
+	if err != nil {
+		return TempEntry{}, errors.Wrap(err, "getTemperatures:ioutil.ReadAll")
+	}
+	if err = json.Unmarshal(body, &entry); err != nil {
+		return TempEntry{}, errors.Wrap(err, "getTemperatures:json.Unmarshal")
+	}
+	return entry, nil
 }
 
 func storeTempEntry(entry TempEntry, db *sql.DB) error {
@@ -190,6 +216,40 @@ InsertedDatetime
 	return nil
 }
 
+// Runs as goroutine, waits for signal to start recording
+// temps. When end of run is received, records additional
+// temps based on config file entry.
+func tempLogger(tempLoggerChan chan int) {
+
+	log.Debug("tempLogger goroutine started")
+	active := 0
+	postp := 0
+	loop := true
+	for loop == true {
+		select {
+		case active = <-tempLoggerChan:
+			log.Debugf("active = %d", active)
+		default:
+			if active == 1 || postp > 0 {
+				log.Debugf("tempLogger passes: %d", postp)
+				entry, _ := getTemperatures()
+				storeTempEntry(entry, runtempsDB)
+				//time.Sleep(3 * time.Second)
+				time.Sleep(2 * time.Minute)
+				if active == 1 {
+					postp = 11 // 10 passes
+				}
+			} else if active == 2 {
+				loop = false
+			}
+			if postp > 0 {
+				postp--
+			}
+		}
+	}
+	log.Debug("tempLogger goroutine ended")
+}
+
 func storeTempsHandler(writer http.ResponseWriter, request *http.Request) {
 	var storeTempsHandlerError error = nil
 	var entry TempEntry
@@ -209,38 +269,24 @@ func storeTempsHandler(writer http.ResponseWriter, request *http.Request) {
 	vars := mux.Vars(request)
 	command := vars["command"]
 	log.Debugf("command = %s", command)
-	var netClient = &http.Client{
-		Timeout: time.Second * 30,
-	}
-	log.Debugf("Sending GET to: %s", configFile.urlTempServer)
-	response, err := netClient.Get(configFile.urlTempServer)
-	if err != nil {
-		storeTempsHandlerError = errors.Wrap(err, "storeTempsHandler:netClient.Get")
-		respond()
-		return
-	}
-	body, err := ioutil.ReadAll(response.Body)
-	if err != nil {
-		storeTempsHandlerError = errors.Wrap(err, "storeTempsHandler:ioutil.ReadAll")
-		respond()
-		return
-	}
-	if err = json.Unmarshal(body, &entry); err != nil {
-		storeTempsHandlerError = errors.Wrap(err, "storeTempsHandler:json.Unmarshal")
-		respond()
-		return
-	}
 	switch command {
 	case "store":
 		storeTempsHandlerError = storeTempEntry(entry, alltempsDB)
 	case "run":
-		storeTempsHandlerError = storeTempEntry(entry, runtempsDB)
+		log.Debug("Sent tempLogger signal 1")
+		tempLoggerChan <- 1
 	}
 	if storeTempsHandlerError != nil {
 		log.Debug("storeTempsHandlerError = " + storeTempsHandlerError.Error())
 	}
 	respond()
 	log.Debug("Exiting storeTempsHandler")
+}
+
+func mainloop() {
+	exitSignal := make(chan os.Signal)
+	signal.Notify(exitSignal, syscall.SIGINT, syscall.SIGTERM)
+	<-exitSignal
 }
 
 func main() {
@@ -303,6 +349,7 @@ func main() {
 		runtime.Goexit()
 	}
 	log.Debug("DBase access and/or creation completed")
+	go tempLogger(tempLoggerChan)
 	request := mux.NewRouter()
 	request.HandleFunc("/burnerlogger", storeRunEntryHandler).Methods("POST")
 	request.HandleFunc("/temps/{command}", storeTempsHandler)
@@ -312,4 +359,6 @@ func main() {
 		log.Errorf("HTTP server error: %s\n", err)
 		runtime.Goexit()
 	}
+	mainloop()
+	tempLoggerChan <- 2
 }
