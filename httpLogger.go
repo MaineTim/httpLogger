@@ -5,13 +5,6 @@ package main
 import (
 	"database/sql"
 	"encoding/json"
-	log "github.com/Sirupsen/logrus"
-	// "github.com/davecgh/go-spew/spew"
-	"github.com/docopt/docopt-go"
-	"github.com/gorilla/mux"
-	_ "github.com/mattn/go-sqlite3"
-	"github.com/pkg/errors"
-	"github.com/spf13/viper"
 	"io/ioutil"
 	"net/http"
 	"os"
@@ -19,6 +12,13 @@ import (
 	"runtime"
 	"syscall"
 	"time"
+
+	log "github.com/Sirupsen/logrus"
+	"github.com/docopt/docopt-go"
+	"github.com/gorilla/mux"
+	_ "github.com/mattn/go-sqlite3"
+	"github.com/pkg/errors"
+	"github.com/spf13/viper"
 )
 
 const version = ".01b-2017Nov21"
