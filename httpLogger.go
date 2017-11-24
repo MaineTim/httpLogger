@@ -21,7 +21,7 @@ import (
 	"github.com/spf13/viper"
 )
 
-const version = ".01b-2017Nov21"
+const version = ".01c-2017Nov24"
 const usage = `
 httpLogger
 
@@ -76,15 +76,20 @@ type ConfigFile struct {
 	loggerPort     string
 }
 
-var (
+type AppContext struct {
 	runtimesDB               *sql.DB
 	alltempsDB               *sql.DB
 	runtempsDB               *sql.DB
 	storeRunTempHandlerError error
 	storeTemperatureHandler  error
 	configFile               ConfigFile
-	tempLoggerChan           = make(chan int, 1)
-)
+	tempLoggerChan           chan int
+}
+
+type appHandler struct {
+	*AppContext
+	H func(*AppContext, http.ResponseWriter, *http.Request) (int, error)
+}
 
 func initDBase(filepath string) (*sql.DB, error) {
 	db, err := sql.Open("sqlite3", filepath)
@@ -104,7 +109,9 @@ func createTable(db *sql.DB, sqlTable string) error {
 	return nil
 }
 
-func storeRunEntry(entry RunEntry) error {
+// Runtime entry processing
+
+func storeRunEntry(ah AppContext, entry RunEntry) error {
 	log.Debug("Entered storeRunEntry")
 	sqlAdditem := `
 INSERT INTO runtimes(
@@ -113,7 +120,7 @@ EndTime,
 InsertionTime
 ) values(?, ?, ?)
 `
-	stmt, err := runtimesDB.Prepare(sqlAdditem)
+	stmt, err := ah.runtimesDB.Prepare(sqlAdditem)
 	if err != nil {
 		log.Debug("Prepare result: " + err.Error())
 		return errors.Wrap(err, "storeRunEntry:db.Prepare")
@@ -129,7 +136,7 @@ InsertionTime
 	return nil
 }
 
-func storeRunEntryHandler(writer http.ResponseWriter, request *http.Request) {
+func (ah AppContext) storeRunEntryHandler(writer http.ResponseWriter, request *http.Request) {
 	var storeRunEntryHandlerError error = nil
 	var entry RunEntry
 
@@ -145,7 +152,7 @@ func storeRunEntryHandler(writer http.ResponseWriter, request *http.Request) {
 
 	writer.Header().Set("Content-Type", "application/json")
 	log.Debug("Entered storeRunEntryHandler")
-	tempLoggerChan <- 0
+	ah.tempLoggerChan <- 0
 	body, err := ioutil.ReadAll(request.Body)
 	if err != nil {
 		storeRunEntryHandlerError = errors.Wrap(err, "storeRunEntryHandler:ioutil.ReadAll")
@@ -157,7 +164,7 @@ func storeRunEntryHandler(writer http.ResponseWriter, request *http.Request) {
 		respond()
 		return
 	}
-	storeRunEntryHandlerError = storeRunEntry(entry)
+	storeRunEntryHandlerError = storeRunEntry(ah, entry)
 	if storeRunEntryHandlerError != nil {
 		log.Debug("storeRunEntryHandlerError = " + storeRunEntryHandlerError.Error())
 	}
@@ -165,15 +172,17 @@ func storeRunEntryHandler(writer http.ResponseWriter, request *http.Request) {
 	log.Debug("Exiting storeRunEntryHandler")
 }
 
-func getTemperatures() (TempEntry, error) {
+// Temperature logging
+
+func getTemperatures(ah *AppContext) (TempEntry, error) {
 
 	var entry TempEntry
 	var netClient = &http.Client{
 		Timeout: time.Second * 30,
 	}
 
-	log.Debugf("Sending GET to: %s", configFile.urlTempServer)
-	response, err := netClient.Get(configFile.urlTempServer)
+	log.Debugf("Sending GET to: %s", ah.configFile.urlTempServer)
+	response, err := netClient.Get(ah.configFile.urlTempServer)
 	if err != nil {
 		return TempEntry{}, errors.Wrap(err, "getTemperatures:netClient.Get")
 	}
@@ -220,7 +229,8 @@ InsertedDatetime
 // Runs as goroutine, waits for signal to start recording
 // temps. When end of run is received, records additional
 // temps based on config file entry.
-func tempLogger(tempLoggerChan chan int) {
+
+func tempLogger(app *AppContext) {
 
 	log.Debug("tempLogger goroutine started")
 	active := 0
@@ -228,15 +238,15 @@ func tempLogger(tempLoggerChan chan int) {
 	loop := true
 	for loop == true {
 		select {
-		case active = <-tempLoggerChan:
+		case active = <-app.tempLoggerChan:
 			log.Debugf("active = %d", active)
 		default:
 			if active == 1 || postp > 0 {
 				log.Debugf("tempLogger passes: %d", postp)
-				entry, _ := getTemperatures()
-				storeTempEntry(entry, runtempsDB)
-				//time.Sleep(3 * time.Second)
-				time.Sleep(2 * time.Minute)
+				entry, _ := getTemperatures(app)
+				storeTempEntry(entry, app.runtempsDB)
+				time.Sleep(3 * time.Second)
+				//time.Sleep(2 * time.Minute)
 				if active == 1 {
 					postp = 11 // 10 passes
 				}
@@ -251,7 +261,7 @@ func tempLogger(tempLoggerChan chan int) {
 	log.Debug("tempLogger goroutine ended")
 }
 
-func storeTempsHandler(writer http.ResponseWriter, request *http.Request) {
+func (ah AppContext) storeTempsHandler(writer http.ResponseWriter, request *http.Request) {
 	var storeTempsHandlerError error = nil
 	var entry TempEntry
 
@@ -272,10 +282,10 @@ func storeTempsHandler(writer http.ResponseWriter, request *http.Request) {
 	log.Debugf("command = %s", command)
 	switch command {
 	case "store":
-		storeTempsHandlerError = storeTempEntry(entry, alltempsDB)
+		storeTempsHandlerError = storeTempEntry(entry, ah.alltempsDB)
 	case "run":
 		log.Debug("Sent tempLogger signal 1")
-		tempLoggerChan <- 1
+		ah.tempLoggerChan <- 1
 	}
 	if storeTempsHandlerError != nil {
 		log.Debug("storeTempsHandlerError = " + storeTempsHandlerError.Error())
@@ -283,6 +293,8 @@ func storeTempsHandler(writer http.ResponseWriter, request *http.Request) {
 	respond()
 	log.Debug("Exiting storeTempsHandler")
 }
+
+// Main
 
 func mainloop() {
 	exitSignal := make(chan os.Signal)
@@ -296,17 +308,19 @@ func main() {
 	)
 	defer os.Exit(0)
 
+	app := new(AppContext)
+	app.tempLoggerChan = make(chan int, 1)
 	viper.SetConfigFile("httpLogger.toml")
 	//	viper.AddConfigPath(".")
 	if err = viper.ReadInConfig(); err != nil {
 		log.Errorf("Config file error: %s", err)
 		runtime.Goexit()
 	} else {
-		configFile.pathRuntimesDB = viper.GetString("DBs.runtimes")
-		configFile.pathAlltempsDB = viper.GetString("DBs.alltemps")
-		configFile.pathRunTempsDB = viper.GetString("DBs.runtemps")
-		configFile.urlTempServer = viper.GetString("Servers.temperatures")
-		configFile.loggerPort = viper.GetString("Servers.httploggerport")
+		app.configFile.pathRuntimesDB = viper.GetString("DBs.runtimes")
+		app.configFile.pathAlltempsDB = viper.GetString("DBs.alltemps")
+		app.configFile.pathRunTempsDB = viper.GetString("DBs.runtemps")
+		app.configFile.urlTempServer = viper.GetString("Servers.temperatures")
+		app.configFile.loggerPort = viper.GetString("Servers.httploggerport")
 	}
 	Formatter := new(log.TextFormatter)
 	Formatter.TimestampFormat = "02-Jan-2006 15:04:05"
@@ -323,44 +337,44 @@ func main() {
 		log.SetLevel(log.ErrorLevel)
 	}
 	log.Info("httpLogger " + version + " starting")
-	if runtimesDB, err = initDBase(configFile.pathRuntimesDB); err != nil {
+	if app.runtimesDB, err = initDBase(app.configFile.pathRuntimesDB); err != nil {
 		log.Errorf("Runtimes database initialization failed with error: %s\n", err)
 		runtime.Goexit()
 	}
-	defer runtimesDB.Close()
-	if err = createTable(runtimesDB, runtimesSQLTable); err != nil {
+	defer app.runtimesDB.Close()
+	if err = createTable(app.runtimesDB, runtimesSQLTable); err != nil {
 		log.Errorf("Table creation failed with error: %s\n", err)
 		runtime.Goexit()
 	}
-	if alltempsDB, err = initDBase(configFile.pathAlltempsDB); err != nil {
+	if app.alltempsDB, err = initDBase(app.configFile.pathAlltempsDB); err != nil {
 		log.Errorf("Alltemps database initialization failed with error: %s\n", err)
 		runtime.Goexit()
 	}
-	defer alltempsDB.Close()
-	if err = createTable(alltempsDB, tempSQLTable); err != nil {
+	defer app.alltempsDB.Close()
+	if err = createTable(app.alltempsDB, tempSQLTable); err != nil {
 		log.Errorf("Table creation failed with error: %s\n", err)
 		runtime.Goexit()
 	}
-	if runtempsDB, err = initDBase(configFile.pathRunTempsDB); err != nil {
+	if app.runtempsDB, err = initDBase(app.configFile.pathRunTempsDB); err != nil {
 		log.Errorf("Runtemps database initialization failed with error: %s\n", err)
 		runtime.Goexit()
 	}
-	defer runtempsDB.Close()
-	if err = createTable(runtempsDB, tempSQLTable); err != nil {
+	defer app.runtempsDB.Close()
+	if err = createTable(app.runtempsDB, tempSQLTable); err != nil {
 		log.Errorf("Table creation failed with error: %s\n", err)
 		runtime.Goexit()
 	}
 	log.Debug("DBase access and/or creation completed")
-	go tempLogger(tempLoggerChan)
+	go tempLogger(app)
 	request := mux.NewRouter()
-	request.HandleFunc("/burnerlogger", storeRunEntryHandler).Methods("POST")
-	request.HandleFunc("/temps/{command}", storeTempsHandler)
+	request.HandleFunc("/burnerlogger", app.storeRunEntryHandler).Methods("POST")
+	request.HandleFunc("/temps/{command}", app.storeTempsHandler)
 	log.Debug("HTTP handlers registered")
 	http.Handle("/", request)
-	if err = http.ListenAndServe(":"+configFile.loggerPort, nil); err != nil {
+	if err = http.ListenAndServe(":"+app.configFile.loggerPort, nil); err != nil {
 		log.Errorf("HTTP server error: %s\n", err)
 		runtime.Goexit()
 	}
 	mainloop()
-	tempLoggerChan <- 2
+	app.tempLoggerChan <- 2
 }
