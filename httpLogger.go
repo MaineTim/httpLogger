@@ -73,6 +73,7 @@ type ConfigFile struct {
 	pathAlltempsDB string
 	pathRunTempsDB string
 	urlTempServer  string
+	loggerPort     string
 }
 
 var (
@@ -305,6 +306,7 @@ func main() {
 		configFile.pathAlltempsDB = viper.GetString("DBs.alltemps")
 		configFile.pathRunTempsDB = viper.GetString("DBs.runtemps")
 		configFile.urlTempServer = viper.GetString("Servers.temperatures")
+		configFile.loggerPort = viper.GetString("Servers.httploggerport")
 	}
 	Formatter := new(log.TextFormatter)
 	Formatter.TimestampFormat = "02-Jan-2006 15:04:05"
@@ -355,7 +357,7 @@ func main() {
 	request.HandleFunc("/temps/{command}", storeTempsHandler)
 	log.Debug("HTTP handlers registered")
 	http.Handle("/", request)
-	if err = http.ListenAndServe(":8000", nil); err != nil {
+	if err = http.ListenAndServe(":"+configFile.loggerPort, nil); err != nil {
 		log.Errorf("HTTP server error: %s\n", err)
 		runtime.Goexit()
 	}

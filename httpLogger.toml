@@ -5,3 +5,4 @@ runtemps = "test_runtemps.db"
 
 [Servers]
 temperatures = "http://security:8000/alltemps"
+httploggerport = "5000"
