@@ -3,7 +3,6 @@
 package main
 
 import (
-	"database/sql"
 	"encoding/json"
 	"io/ioutil"
 	"net/http"
@@ -14,14 +13,14 @@ import (
 	"time"
 
 	log "github.com/Sirupsen/logrus"
+	"github.com/boltdb/bolt"
 	"github.com/docopt/docopt-go"
 	"github.com/gorilla/mux"
-	_ "github.com/mattn/go-sqlite3"
 	"github.com/pkg/errors"
 	"github.com/spf13/viper"
 )
 
-const version = ".01c-2017Nov24"
+const version = ".02alpha1-2017Nov25"
 const usage = `
 httpLogger
 
@@ -35,55 +34,36 @@ Options:
              [default: e]
  -v         Show version.
 `
-const runtimesSQLTable = `
-CREATE TABLE IF NOT EXISTS runtimes(
-StartTime TEXT,
-EndTime TEXT,
-InsertionTime TEXT
-);
-`
-const tempSQLTable = `
-CREATE TABLE IF NOT EXISTS temps(
-Basement REAL,
-Bed REAL, 
-Crawlspace REAL, 
-Downstairs REAL,
-Garage REAL,
-Upstairs REAL,
-InsertedDatetime TEXT
-);
-`
 
 type RunEntry struct {
-	StartTime string `json:"startTime"`
-	EndTime   string `json:"endTime"`
+	SerialNumber int    `json:"serialNumber"`
+	StartTime    string `json:"startTime"`
+	EndTime      string `json:"endTime"`
 }
 
 type TempEntry struct {
-	Basement   float64 `json:"basement"`
-	Bed        float64 `json:"bed"`
-	Crawlspace float64 `json:"crawlspace"`
-	Downstairs float64 `json:"downstairs"`
-	Garage     float64 `json:"garage"`
-	Upstairs   float64 `json:"upstairs"`
+	SerialNumber int     `json:"serialNumber"`
+	Basement     float64 `json:"basement"`
+	Bed          float64 `json:"bed"`
+	Crawlspace   float64 `json:"crawlspace"`
+	Downstairs   float64 `json:"downstairs"`
+	Garage       float64 `json:"garage"`
+	Upstairs     float64 `json:"upstairs"`
 }
 
 type ConfigFile struct {
-	pathRuntimesDB string
-	pathAlltempsDB string
-	pathRunTempsDB string
-	urlTempServer  string
-	loggerPort     string
+	pathBurnerLogDB string
+	urlTempServer   string
+	loggerPort      string
 }
 
 type AppContext struct {
-	runtimesDB               *sql.DB
-	alltempsDB               *sql.DB
-	runtempsDB               *sql.DB
+	burnerLogDB              *bolt.DB
 	storeRunTempHandlerError error
 	storeTemperatureHandler  error
 	configFile               ConfigFile
 	tempLoggerChan           chan int
+	serialNumber             int
 }
 
 type appHandler struct {
@@ -91,50 +71,58 @@ type appHandler struct {
 	H func(*AppContext, http.ResponseWriter, *http.Request) (int, error)
 }
 
-func initDBase(filepath string) (*sql.DB, error) {
-	db, err := sql.Open("sqlite3", filepath)
-	if err == nil && db != nil {
-		_, err = db.Exec("pragma synchronous")
-	}
+// Initializes the database named in filepath, and creates
+// the required buckets.
+// Returns a bolt.DB pointer and any setup errors.
+
+func initDBase(filepath string) (*bolt.DB, error) {
+	db, err := bolt.Open(filepath, 0777, nil)
 	if err != nil {
-		return nil, errors.Wrap(err, "initDBase")
+		return nil, errors.Wrap(err, "initDBase:Open")
+	}
+	for _, bucket := range []string{"serial", "times", "temps"} {
+		err = db.Update(func(tx *bolt.Tx) error {
+			_, err := tx.CreateBucketIfNotExists([]byte(bucket))
+			if err != nil {
+				return errors.Wrap(err, "initDBase:CreateBucket")
+			}
+			if err != nil {
+				return errors.Wrap(err, "initDBase:Update")
+			}
+			return nil
+		})
+		if err != nil {
+			return nil, err
+		}
 	}
 	return db, nil
 }
 
-func createTable(db *sql.DB, sqlTable string) error {
-	if _, err := db.Exec(sqlTable); err != nil {
-		return errors.Wrap(err, "createTable")
-	}
-	return nil
-}
-
-// Runtime entry processing
+// Stores a RunEntry in JSON in the "times" bucket.
+// Adds a timestamp as key.
+// Returns any errors.
 
 func storeRunEntry(ah AppContext, entry RunEntry) error {
 	log.Debug("Entered storeRunEntry")
-	sqlAdditem := `
-INSERT INTO runtimes(
-StartTime,
-EndTime,
-InsertionTime
-) values(?, ?, ?)
-`
-	stmt, err := ah.runtimesDB.Prepare(sqlAdditem)
+	record, err := json.Marshal(entry)
 	if err != nil {
-		log.Debug("Prepare result: " + err.Error())
-		return errors.Wrap(err, "storeRunEntry:db.Prepare")
+		log.Debug("json.Marshal result: " + err.Error())
+		return errors.Wrap(err, "storeRunEntry:json.Marshal")
 	}
-	defer stmt.Close()
-
-	_, err = stmt.Exec(entry.StartTime, entry.EndTime, time.Now().Format(time.RFC3339))
-	if err != nil {
-		log.Debug("Exec result: " + err.Error())
-		return errors.Wrap(err, "storeRunEntry:stmt.Exec")
-	}
+	err = ah.burnerLogDB.Update(func(tx *bolt.Tx) error {
+		err := tx.Bucket([]byte("times")).Put([]byte(time.Now().UTC().Format(time.RFC3339)), record)
+		if err != nil {
+			return errors.Wrap(err, "storeRunEntry:DBPut")
+		}
+		return nil
+	})
 	log.Info("Logged run time")
-	return nil
+	return err
+	/* TODO: Look at Update error handling */
 }
+
+// Handlerfunc for "/burnerlogger".
+// Sends any errors to the client.
 
 func (ah AppContext) storeRunEntryHandler(writer http.ResponseWriter, request *http.Request) {
 	var storeRunEntryHandlerError error = nil
@@ -164,6 +152,7 @@ func (ah AppContext) storeRunEntryHandler(writer http.ResponseWriter, request *h
 		respond()
 		return
 	}
+	entry.SerialNumber = ah.serialNumber
 	storeRunEntryHandlerError = storeRunEntry(ah, entry)
 	if storeRunEntryHandlerError != nil {
 		log.Debug("storeRunEntryHandlerError = " + storeRunEntryHandlerError.Error())
@@ -172,7 +161,8 @@ func (ah AppContext) storeRunEntryHandler(writer http.ResponseWriter, request *h
 	log.Debug("Exiting storeRunEntryHandler")
 }
 
-// Temperature logging
+// Retrieves a temperature set and puts it in a TempEntry.
+// Returns the TempEntry and any errors.
 
 func getTemperatures(ah *AppContext) (TempEntry, error) {
 
@@ -196,34 +186,28 @@ func getTemperatures(ah *AppContext) (TempEntry, error) {
 	return entry, nil
 }
 
-func storeTempEntry(entry TempEntry, db *sql.DB) error {
-	log.Debug("Entered storeTempEntry")
-	sqlAdditem := `
-INSERT INTO temps (
-Basement,
-Bed, 
-Crawlspace, 
-Downstairs,
-Garage,
-Upstairs,
-InsertedDatetime
-) values(?, ?, ?, ?, ?, ?, ?)
-`
-	stmt, err := db.Prepare(sqlAdditem)
-	if err != nil {
-		log.Debug("Prepare result: " + err.Error())
-		return errors.Wrap(err, "storeTempEntry:db.Prepare")
-	}
-	defer stmt.Close()
+// Stores a TempEntry in JSON in the "temps" bucket.
+// Adds a timestamp as a key.
+// Returns any errors.
 
-	_, err = stmt.Exec(entry.Basement, entry.Bed, entry.Crawlspace,
-		entry.Downstairs, entry.Garage, entry.Upstairs, time.Now().Format(time.RFC3339))
+func storeTempEntry(ah *AppContext, entry TempEntry, bucket string) error {
+	log.Debug("Entered storeTempEntry")
+
+	record, err := json.Marshal(entry)
 	if err != nil {
-		log.Debug("Exec result: " + err.Error())
-		return errors.Wrap(err, "storeTempEntry:stmt.Exec")
+		log.Debug("json.Marshal result: " + err.Error())
+		return errors.Wrap(err, "storeTempEntry:json.Marshal")
 	}
+	err = ah.burnerLogDB.Update(func(tx *bolt.Tx) error {
+		err := tx.Bucket([]byte(bucket)).Put([]byte(time.Now().UTC().Format(time.RFC3339)), record)
+		if err != nil {
+			return errors.Wrap(err, "storeTempEntry:DBPut")
+		}
+		return nil
+	})
 	log.Info("Logged temps")
-	return nil
+	return err
+	/* TODO: Look at Update error handling */
 }
 
 // Runs as goroutine, waits for signal to start recording
@@ -244,7 +228,7 @@ func tempLogger(app *AppContext) {
 			if active == 1 || postp > 0 {
 				log.Debugf("tempLogger passes: %d", postp)
 				entry, _ := getTemperatures(app)
-				storeTempEntry(entry, app.runtempsDB)
+				storeTempEntry(app, entry, "temps")
 				time.Sleep(3 * time.Second)
 				//time.Sleep(2 * time.Minute)
 				if active == 1 {
@@ -261,9 +245,11 @@ func tempLogger(app *AppContext) {
 	log.Debug("tempLogger goroutine ended")
 }
 
+// Handlerfunc for "/temps/{command}".
+// Sends any errors to the client.
+
 func (ah AppContext) storeTempsHandler(writer http.ResponseWriter, request *http.Request) {
 	var storeTempsHandlerError error = nil
-	var entry TempEntry
 
 	respond := func() {
 		if storeTempsHandlerError != nil {
@@ -277,16 +263,8 @@ func (ah AppContext) storeTempsHandler(writer http.ResponseWriter, request *http
 
 	writer.Header().Set("Content-Type", "application/json")
 	log.Debug("Entered storeTempsHandler")
-	vars := mux.Vars(request)
-	command := vars["command"]
-	log.Debugf("command = %s", command)
-	switch command {
-	case "store":
-		storeTempsHandlerError = storeTempEntry(entry, ah.alltempsDB)
-	case "run":
-		log.Debug("Sent tempLogger signal 1")
-		ah.tempLoggerChan <- 1
-	}
+	log.Debug("Sent tempLogger signal 1")
+	ah.tempLoggerChan <- 1
 	if storeTempsHandlerError != nil {
 		log.Debug("storeTempsHandlerError = " + storeTempsHandlerError.Error())
 	}
@@ -311,14 +289,11 @@ func main() {
 	app := new(AppContext)
 	app.tempLoggerChan = make(chan int, 1)
 	viper.SetConfigFile("httpLogger.toml")
-	//	viper.AddConfigPath(".")
 	if err = viper.ReadInConfig(); err != nil {
 		log.Errorf("Config file error: %s", err)
 		runtime.Goexit()
 	} else {
-		app.configFile.pathRuntimesDB = viper.GetString("DBs.runtimes")
-		app.configFile.pathAlltempsDB = viper.GetString("DBs.alltemps")
-		app.configFile.pathRunTempsDB = viper.GetString("DBs.runtemps")
+		app.configFile.pathBurnerLogDB = viper.GetString("DBs.burnerlog")
 		app.configFile.urlTempServer = viper.GetString("Servers.temperatures")
 		app.configFile.loggerPort = viper.GetString("Servers.httploggerport")
 	}
@@ -337,42 +312,21 @@ func main() {
 		log.SetLevel(log.ErrorLevel)
 	}
 	log.Info("httpLogger " + version + " starting")
-	if app.runtimesDB, err = initDBase(app.configFile.pathRuntimesDB); err != nil {
-		log.Errorf("Runtimes database initialization failed with error: %s\n", err)
+	if app.burnerLogDB, err = initDBase(app.configFile.pathBurnerLogDB); err != nil {
+		log.Errorf("Burnerlog database initialization failed with error: %s\n", err)
 		runtime.Goexit()
 	}
-	defer app.runtimesDB.Close()
-	if err = createTable(app.runtimesDB, runtimesSQLTable); err != nil {
-		log.Errorf("Table creation failed with error: %s\n", err)
-		runtime.Goexit()
-	}
-	if app.alltempsDB, err = initDBase(app.configFile.pathAlltempsDB); err != nil {
-		log.Errorf("Alltemps database initialization failed with error: %s\n", err)
-		runtime.Goexit()
-	}
-	defer app.alltempsDB.Close()
-	if err = createTable(app.alltempsDB, tempSQLTable); err != nil {
-		log.Errorf("Table creation failed with error: %s\n", err)
-		runtime.Goexit()
-	}
-	if app.runtempsDB, err = initDBase(app.configFile.pathRunTempsDB); err != nil {
-		log.Errorf("Runtemps database initialization failed with error: %s\n", err)
-		runtime.Goexit()
-	}
-	defer app.runtempsDB.Close()
-	if err = createTable(app.runtempsDB, tempSQLTable); err != nil {
-		log.Errorf("Table creation failed with error: %s\n", err)
-		runtime.Goexit()
-	}
+	defer app.burnerLogDB.Close()
 	log.Debug("DBase access and/or creation completed")
 	go tempLogger(app)
 	request := mux.NewRouter()
 	request.HandleFunc("/burnerlogger", app.storeRunEntryHandler).Methods("POST")
 	request.HandleFunc("/temps/{command}", app.storeTempsHandler)
-	log.Debug("HTTP handlers registered")
 	http.Handle("/", request)
+	log.Debug("HTTP handlers registered")
+	log.Debugf("HTTP Server started, listening on :%s", app.configFile.loggerPort)
 	if err = http.ListenAndServe(":"+app.configFile.loggerPort, nil); err != nil {
-		log.Errorf("HTTP server error: %s\n", err)
+		log.Errorf("HTTP server error: %s", err)
 		runtime.Goexit()
 	}
 	mainloop()
