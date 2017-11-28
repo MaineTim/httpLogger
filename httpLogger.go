@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -20,7 +21,7 @@ import (
 	"github.com/spf13/viper"
 )
 
-const version = ".02alpha1-2017Nov25"
+const version = ".02beta1-2017Nov27"
 const usage = `
 httpLogger
 
@@ -55,6 +56,7 @@ type ConfigFile struct {
 	pathBurnerLogDB string
 	urlTempServer   string
 	loggerPort      string
+	postRecords     int
 }
 
 type AppContext struct {
@@ -98,11 +100,36 @@ func initDBase(filepath string) (*bolt.DB, error) {
 	return db, nil
 }
 
+// Retrieves SerialNumber from dbase and
+// assigns it to app.serialNumber.
+// Returns any error.
+
+func getSerialNumber(app *AppContext) error {
+	err := app.burnerLogDB.View(func(tx *bolt.Tx) error {
+		temp := tx.Bucket([]byte("serial")).Get([]byte("serial"))
+		app.serialNumber, _ = strconv.Atoi(string(temp))
+		return nil
+	})
+	return err
+}
+
+// Stores SerialNumber in bucket "serial" and
+// returns any error.
+
+func storeSerialNumber(app *AppContext) error {
+	log.Debugf("Storing serial number: %d", app.serialNumber)
+	err := app.burnerLogDB.Update(func(tx *bolt.Tx) error {
+		err := tx.Bucket([]byte("serial")).Put([]byte("serial"), []byte(strconv.Itoa(app.serialNumber)))
+		return errors.Wrap(err, "storeSerialNumber:Put")
+	})
+	return errors.Wrap(err, "storeSerialNumber:Update")
+}
+
 // Stores a RunEntry in JSON in the "times" bucket.
 // Adds a timestamp as key.
 // Returns any errors.
 
-func storeRunEntry(ah AppContext, entry RunEntry) error {
+func storeRunEntry(ah *AppContext, entry RunEntry) error {
 	log.Debug("Entered storeRunEntry")
 	record, err := json.Marshal(entry)
 	if err != nil {
@@ -124,7 +151,7 @@ func storeRunEntry(ah AppContext, entry RunEntry) error {
 // Handlerfunc for "/burnerlogger".
 // Sends any errors to the client.
 
-func (ah AppContext) storeRunEntryHandler(writer http.ResponseWriter, request *http.Request) {
+func (ah *AppContext) storeRunEntryHandler(writer http.ResponseWriter, request *http.Request) {
 	var storeRunEntryHandlerError error = nil
 	var entry RunEntry
 
@@ -134,7 +161,8 @@ func (ah AppContext) storeRunEntryHandler(writer http.ResponseWriter, request *h
 			writer.Write([]byte(storeRunEntryHandlerError.Error()))
 		} else {
 			writer.WriteHeader(http.StatusCreated)
-			writer.Write([]byte("RunEntry stored"))
+			writer.Write([]byte("RunEntry stored - SerialNumber = " +
+				strconv.Itoa(ah.serialNumber)))
 		}
 	}
 
@@ -158,7 +186,7 @@ func (ah AppContext) storeRunEntryHandler(writer http.ResponseWriter, request *h
 		log.Debug("storeRunEntryHandlerError = " + storeRunEntryHandlerError.Error())
 	}
 	respond()
-	log.Debug("Exiting storeRunEntryHandler")
+	log.Debugf("Exiting storeRunEntryHandler - SerialNumber: %d", ah.serialNumber)
 }
 
 // Retrieves a temperature set and puts it in a TempEntry.
@@ -193,6 +221,7 @@ func getTemperatures(ah *AppContext) (TempEntry, error) {
 func storeTempEntry(ah *AppContext, entry TempEntry, bucket string) error {
 	log.Debug("Entered storeTempEntry")
 
+	entry.SerialNumber = ah.serialNumber
 	record, err := json.Marshal(entry)
 	if err != nil {
 		log.Debug("json.Marshal result: " + err.Error())
@@ -210,9 +239,9 @@ func storeTempEntry(ah *AppContext, entry TempEntry, bucket string) error {
 	/* TODO: Look at Update error handling */
 }
 
-// Runs as goroutine, waits for signal to start recording
-// temps. When end of run is received, records additional
-// temps based on config file entry.
+// Runs as goroutine, waits for signal (1) to start recording
+// temps. When end of run is received (0), records additional
+// temps based on postRecords. Terminates on signal (2).
 
 func tempLogger(app *AppContext) {
 
@@ -232,7 +261,7 @@ func tempLogger(app *AppContext) {
 				time.Sleep(3 * time.Second)
 				//time.Sleep(2 * time.Minute)
 				if active == 1 {
-					postp = 11 // 10 passes
+					postp = app.configFile.postRecords + 1
 				}
 			} else if active == 2 {
 				loop = false
@@ -246,9 +275,11 @@ func tempLogger(app *AppContext) {
 }
 
 // Handlerfunc for "/temps/{command}".
+// When called, it sends a signal to the tempLogger goroutine
+// to begin its logging ops and responds to the client.
 // Sends any errors to the client.
 
-func (ah AppContext) storeTempsHandler(writer http.ResponseWriter, request *http.Request) {
+func (ah *AppContext) storeTempsHandler(writer http.ResponseWriter, request *http.Request) {
 	var storeTempsHandlerError error = nil
 
 	respond := func() {
@@ -257,27 +288,58 @@ func (ah AppContext) storeTempsHandler(writer http.ResponseWriter, request *http
 			writer.Write([]byte(storeTempsHandlerError.Error()))
 		} else {
 			writer.WriteHeader(http.StatusCreated)
-			writer.Write([]byte("Temperatures stored"))
+			writer.Write([]byte("Temperatures stored - SerialNumber = " +
+				strconv.Itoa(ah.serialNumber)))
 		}
 	}
 
 	writer.Header().Set("Content-Type", "application/json")
 	log.Debug("Entered storeTempsHandler")
 	log.Debug("Sent tempLogger signal 1")
+	ah.serialNumber++
 	ah.tempLoggerChan <- 1
 	if storeTempsHandlerError != nil {
 		log.Debug("storeTempsHandlerError = " + storeTempsHandlerError.Error())
 	}
 	respond()
-	log.Debug("Exiting storeTempsHandler")
+	log.Debugf("Exiting storeTempsHandler - SerialNumber: %d", ah.serialNumber)
+}
+
+// Starts the HTTP server in a goroutine.
+// Returns server ID so we can call shutdown with it later.
+
+func startHTTPServer(app *AppContext) *http.Server {
+
+	srv := &http.Server{
+		Addr:         ":" + app.configFile.loggerPort,
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 10 * time.Second,
+	}
+	go func() {
+		if err := srv.ListenAndServe(); err != nil {
+			log.Debugf("Httpserver: ListenAndServe(): %s", err)
+		}
+	}()
+	log.Debugf("HTTP Server started, listening on :%s", app.configFile.loggerPort)
+	return srv // returning reference so caller can call Shutdown()
 }
 
 // Main
 
-func mainloop() {
+func mainloop(app *AppContext, srv *http.Server) {
+	log.Debug("Entering mainloop()")
 	exitSignal := make(chan os.Signal)
 	signal.Notify(exitSignal, syscall.SIGINT, syscall.SIGTERM)
 	<-exitSignal
+	log.Debug("Shutting down...")
+	if err := srv.Shutdown(nil); err != nil {
+		log.Errorf("mainloop:srv.Shutdown: %s", err)
+	}
+	err := storeSerialNumber(app)
+	if err != nil {
+		log.Errorf("Serial Number storage error: %s", err)
+	}
+	app.tempLoggerChan <- 2
 }
 
 func main() {
@@ -296,6 +358,7 @@ func main() {
 		app.configFile.pathBurnerLogDB = viper.GetString("DBs.burnerlog")
 		app.configFile.urlTempServer = viper.GetString("Servers.temperatures")
 		app.configFile.loggerPort = viper.GetString("Servers.httploggerport")
+		app.configFile.postRecords, _ = strconv.Atoi(viper.GetString("DBs.postrecords"))
 	}
 	Formatter := new(log.TextFormatter)
 	Formatter.TimestampFormat = "02-Jan-2006 15:04:05"
@@ -318,17 +381,14 @@ func main() {
 	}
 	defer app.burnerLogDB.Close()
 	log.Debug("DBase access and/or creation completed")
+	_ = getSerialNumber(app)
+	log.Debugf("Starting serial number: %d", app.serialNumber)
 	go tempLogger(app)
 	request := mux.NewRouter()
 	request.HandleFunc("/burnerlogger", app.storeRunEntryHandler).Methods("POST")
 	request.HandleFunc("/temps/{command}", app.storeTempsHandler)
 	http.Handle("/", request)
 	log.Debug("HTTP handlers registered")
-	log.Debugf("HTTP Server started, listening on :%s", app.configFile.loggerPort)
-	if err = http.ListenAndServe(":"+app.configFile.loggerPort, nil); err != nil {
-		log.Errorf("HTTP server error: %s", err)
-		runtime.Goexit()
-	}
-	mainloop()
-	app.tempLoggerChan <- 2
+	srv := startHTTPServer(app)
+	mainloop(app, srv)
 }

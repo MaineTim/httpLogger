@@ -1,5 +1,6 @@
 [DBs]
-burnerlog = "test_burnerlog.db"
+burnerlog = "runtimes.db"
+postrecords = 10
 
 [Servers]
 temperatures = "http://security:8000/alltemps"
