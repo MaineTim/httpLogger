@@ -1,4 +1,5 @@
-//httpLogger
+// httpLogger accepts HTTP requests to log oil burner data and house temperatures.
+// It is called by burnerWatcher.
 
 package main
 
@@ -21,7 +22,7 @@ import (
 	"github.com/spf13/viper"
 )
 
-const version = ".02beta1-2017Nov27"
+const version = ".02-2017Dec03"
 const usage = `
 httpLogger
 
@@ -258,8 +259,7 @@ func tempLogger(app *AppContext) {
 				log.Debugf("tempLogger passes: %d", postp)
 				entry, _ := getTemperatures(app)
 				storeTempEntry(app, entry, "temps")
-				time.Sleep(3 * time.Second)
-				//time.Sleep(2 * time.Minute)
+				time.Sleep(2 * time.Minute)
 				if active == 1 {
 					postp = app.configFile.postRecords + 1
 				}
@@ -326,6 +326,8 @@ func startHTTPServer(app *AppContext) *http.Server {
 
 // Main
 
+// Allows us to shut down cleanly, and handle CTRL-C.
+
 func mainloop(app *AppContext, srv *http.Server) {
 	log.Debug("Entering mainloop()")
 	exitSignal := make(chan os.Signal)
@@ -385,8 +387,15 @@ func main() {
 	log.Debugf("Starting serial number: %d", app.serialNumber)
 	go tempLogger(app)
 	request := mux.NewRouter()
+
+	// This route records a burner run entry, and signals the end of the burn
+	// to tempLogger.
 	request.HandleFunc("/burnerlogger", app.storeRunEntryHandler).Methods("POST")
+
+	// This route starts tempLogger's collection of data.
+	// Right now, the command is ignored.
 	request.HandleFunc("/temps/{command}", app.storeTempsHandler)
+
 	http.Handle("/", request)
 	log.Debug("HTTP handlers registered")
 	srv := startHTTPServer(app)
