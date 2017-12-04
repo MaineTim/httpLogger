@@ -78,25 +78,39 @@ type appHandler struct {
 // the required buckets.
 // Returns a bolt.DB pointer and any setup errors.
 
-func initDBase(filepath string) (*bolt.DB, error) {
+func initDBase(filepath string) error {
 	db, err := bolt.Open(filepath, 0777, nil)
 	if err != nil {
-		return nil, errors.Wrap(err, "initDBase:Open")
+		return errors.Wrap(err, "initDBase:Open")
 	}
 	for _, bucket := range []string{"serial", "times", "temps"} {
 		err = db.Update(func(tx *bolt.Tx) error {
 			_, err := tx.CreateBucketIfNotExists([]byte(bucket))
 			if err != nil {
+				db.Close()
 				return errors.Wrap(err, "initDBase:CreateBucket")
 			}
 			if err != nil {
+				db.Close()
 				return errors.Wrap(err, "initDBase:Update")
 			}
 			return nil
 		})
 		if err != nil {
-			return nil, err
+			return err
 		}
+	}
+	db.Close()
+	return nil
+}
+
+func openDBase(app *AppContext) (*bolt.DB, error) {
+
+	log.Debug("Opening database")
+	db, err := bolt.Open(app.configFile.pathBurnerLogDB, 0777, &bolt.Options{Timeout: 1 * time.Second})
+	if err != nil {
+		log.Debug("Can't open database")
+		return nil, errors.Wrap(err, "openDBase:Open")
 	}
 	return db, nil
 }
@@ -106,11 +120,15 @@ func initDBase(filepath string) (*bolt.DB, error) {
 // Returns any error.
 
 func getSerialNumber(app *AppContext) error {
-	err := app.burnerLogDB.View(func(tx *bolt.Tx) error {
-		temp := tx.Bucket([]byte("serial")).Get([]byte("serial"))
-		app.serialNumber, _ = strconv.Atoi(string(temp))
-		return nil
-	})
+	db, err := openDBase(app)
+	if err == nil {
+		defer db.Close()
+		_ = db.View(func(tx *bolt.Tx) error {
+			temp := tx.Bucket([]byte("serial")).Get([]byte("serial"))
+			app.serialNumber, _ = strconv.Atoi(string(temp))
+			return nil
+		})
+	}
 	return err
 }
 
@@ -119,11 +137,16 @@ func getSerialNumber(app *AppContext) error {
 
 func storeSerialNumber(app *AppContext) error {
 	log.Debugf("Storing serial number: %d", app.serialNumber)
-	err := app.burnerLogDB.Update(func(tx *bolt.Tx) error {
-		err := tx.Bucket([]byte("serial")).Put([]byte("serial"), []byte(strconv.Itoa(app.serialNumber)))
-		return errors.Wrap(err, "storeSerialNumber:Put")
-	})
-	return errors.Wrap(err, "storeSerialNumber:Update")
+	db, err := openDBase(app)
+	if err == nil {
+		defer db.Close()
+		err := db.Update(func(tx *bolt.Tx) error {
+			err := tx.Bucket([]byte("serial")).Put([]byte("serial"), []byte(strconv.Itoa(app.serialNumber)))
+			return errors.Wrap(err, "storeSerialNumber:Put")
+		})
+		return errors.Wrap(err, "storeSerialNumber:Update")
+	}
+	return err
 }
 
 // Stores a RunEntry in JSON in the "times" bucket.
@@ -137,13 +160,17 @@ func storeRunEntry(ah *AppContext, entry RunEntry) error {
 		log.Debug("json.Marshal result: " + err.Error())
 		return errors.Wrap(err, "storeRunEntry:json.Marshal")
 	}
-	err = ah.burnerLogDB.Update(func(tx *bolt.Tx) error {
-		err := tx.Bucket([]byte("times")).Put([]byte(time.Now().UTC().Format(time.RFC3339)), record)
-		if err != nil {
-			return errors.Wrap(err, "storeRunEntry:DBPut")
-		}
-		return nil
-	})
+	db, err := openDBase(ah)
+	if err == nil {
+		defer db.Close()
+		err = db.Update(func(tx *bolt.Tx) error {
+			err := tx.Bucket([]byte("times")).Put([]byte(time.Now().UTC().Format(time.RFC3339)), record)
+			if err != nil {
+				return errors.Wrap(err, "storeRunEntry:DBPut")
+			}
+			return nil
+		})
+	}
 	log.Info("Logged run time")
 	return err
 	/* TODO: Look at Update error handling */
@@ -228,13 +255,17 @@ func storeTempEntry(ah *AppContext, entry TempEntry, bucket string) error {
 		log.Debug("json.Marshal result: " + err.Error())
 		return errors.Wrap(err, "storeTempEntry:json.Marshal")
 	}
-	err = ah.burnerLogDB.Update(func(tx *bolt.Tx) error {
-		err := tx.Bucket([]byte(bucket)).Put([]byte(time.Now().UTC().Format(time.RFC3339)), record)
-		if err != nil {
-			return errors.Wrap(err, "storeTempEntry:DBPut")
-		}
-		return nil
-	})
+	db, err := openDBase(ah)
+	if err == nil {
+		defer db.Close()
+		err = db.Update(func(tx *bolt.Tx) error {
+			err := tx.Bucket([]byte(bucket)).Put([]byte(time.Now().UTC().Format(time.RFC3339)), record)
+			if err != nil {
+				return errors.Wrap(err, "storeTempEntry:DBPut")
+			}
+			return nil
+		})
+	}
 	log.Info("Logged temps")
 	return err
 	/* TODO: Look at Update error handling */
@@ -259,7 +290,8 @@ func tempLogger(app *AppContext) {
 				log.Debugf("tempLogger passes: %d", postp)
 				entry, _ := getTemperatures(app)
 				storeTempEntry(app, entry, "temps")
-				time.Sleep(2 * time.Minute)
+				// time.Sleep(2 * time.Minute)
+				time.Sleep(5 * time.Second)
 				if active == 1 {
 					postp = app.configFile.postRecords + 1
 				}
@@ -377,7 +409,7 @@ func main() {
 		log.SetLevel(log.ErrorLevel)
 	}
 	log.Info("httpLogger " + version + " starting")
-	if app.burnerLogDB, err = initDBase(app.configFile.pathBurnerLogDB); err != nil {
+	if err = initDBase(app.configFile.pathBurnerLogDB); err != nil {
 		log.Errorf("Burnerlog database initialization failed with error: %s\n", err)
 		runtime.Goexit()
 	}
